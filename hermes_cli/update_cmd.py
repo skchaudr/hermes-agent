@@ -626,6 +626,25 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
         _check.report_rev_list_verdict(git_cmd, root, compare_branch)
 
 
+def _expose_pm_git() -> None:
+    """Put PM's git on this process's PATH when Windows has no git of its own.
+
+    install.ps1 on a machine without git stages the pinned Git for Windows for
+    its own clone and leaves PATH alone, so the first bare ``git`` of
+    ``hermes update`` died with ``[WinError 2]``. The update is an explicit
+    user action (like ``ensure_tools_for_sync``): acquire PM's git, and every
+    git the update spawns, children included, resolves it from PATH.
+    """
+    if sys.platform != "win32" or shutil.which("git"):
+        return
+    import pm
+
+    env = pm.ensure("git", explicit=True).env
+    path = next((value for key, value in env.items() if key.upper() == "PATH"), None)
+    if path:
+        os.environ["PATH"] = path
+
+
 def _base_git_cmd() -> list[str]:
     """``git`` argv; Windows adds ``-c windows.appendAtomically=false`` (git can fail "unable to
     write loose object file: Invalid argument" on non-atomic appends)."""
@@ -1103,6 +1122,7 @@ def _prepare_git_command() -> tuple[bool, list, bool]:
         print("  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash")
         sys.exit(1)
 
+    _expose_pm_git()
     git_cmd = _base_git_cmd()
     if sys.platform == "win32" and git_dir.exists():
         _git_run(git_cmd, ["config", "windows.appendAtomically", "false"])
