@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import Dict, FrozenSet, Optional
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,16 @@ class UpstreamAdapter(ABC):
             RuntimeError: if the user isn't authenticated or the upstream
               refresh fails. The proxy will return 401 to the client.
         """
+
+    def extra_forward_headers(self, credential: UpstreamCredential) -> Dict[str, str]:
+        """Optional upstream headers merged into each forwarded request."""
+        _ = credential
+        return {}
+
+    def prepare_request_body(self, rel_path: str, body: bytes) -> bytes:
+        """Optional request-body rewrite before forwarding upstream."""
+        _ = rel_path
+        return body
 
     def get_retry_credential(
         self,

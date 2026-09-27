@@ -50,10 +50,6 @@ _HOP_BY_HOP_HEADERS = frozenset(
 
 DEFAULT_PORT = 8645
 DEFAULT_HOST = "127.0.0.1"
-# Body cap for forwarded requests. Chat-completion payloads with long agent
-# conversations can be large; mirror api_server's MAX_REQUEST_BYTES (10 MB).
-# client_max_size bounds every read path, including chunked bodies.
-MAX_REQUEST_BYTES = 10_000_000
 
 
 def _json_error(status: int, message: str, code: str = "proxy_error") -> "web.Response":
@@ -89,10 +85,11 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
     """Build the aiohttp application bound to a specific upstream adapter."""
     if not AIOHTTP_AVAILABLE:
         raise RuntimeError(
-            "aiohttp is required for `hermes proxy`. Run `hermes setup` to install it."
+            "aiohttp is required for `hermes proxy`. Install with: "
+            "pip install 'hermes-agent[messaging]' or `pip install aiohttp`."
         )
 
-    app = web.Application(client_max_size=MAX_REQUEST_BYTES)
+    app = web.Application()
     # AppKey ensures forward-compat with future aiohttp versions that strip
     # bare-string keys.
     _adapter_key = web.AppKey("adapter", UpstreamAdapter)
@@ -132,6 +129,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         # need to forward large multipart uploads we'll switch to streaming
         # the request body too.
         body = await request.read()
+        body = adapter.prepare_request_body(rel_path, body)
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
@@ -142,6 +140,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 upstream_url = f"{upstream_url}?{request.query_string}"
 
             fwd_headers = _filter_request_headers(request.headers)
+            fwd_headers.update(adapter.extra_forward_headers(active_cred))
             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
 
             logger.debug(
@@ -215,6 +214,23 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                     return session_or_response
                 session = session_or_response
 
+        if upstream_resp.status >= 400:
+            err_body = await upstream_resp.text()
+            upstream_resp.release()
+            await session.close()
+            if err_body:
+                logger.warning(
+                    "proxy: upstream %s for %s: %s",
+                    upstream_resp.status,
+                    rel_path,
+                    err_body[:500],
+                )
+            return web.Response(
+                status=upstream_resp.status,
+                text=err_body,
+                headers=_filter_response_headers(upstream_resp.headers),
+            )
+
         # Stream response back. Headers first, then chunked body.
         resp = web.StreamResponse(
             status=upstream_resp.status,
@@ -222,17 +238,34 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         )
         await resp.prepare(request)
 
+        stream_fixer = None
+        if rel_path == "/responses" and getattr(adapter, "name", None) == "codex":
+            from hermes_cli.proxy.adapters.openai_codex import CodexResponsesStreamFixer
+
+            stream_fixer = CodexResponsesStreamFixer()
+
         try:
             async for chunk in upstream_resp.content.iter_any():
                 if chunk:
-                    await resp.write(chunk)
+                    if stream_fixer is not None:
+                        chunk = stream_fixer.feed(chunk)
+                    if chunk:
+                        await resp.write(chunk)
+            if stream_fixer is not None:
+                tail = stream_fixer.flush()
+                if tail:
+                    await resp.write(tail)
         except (aiohttp.ClientError, asyncio.CancelledError) as exc:
             logger.warning("proxy: streaming interrupted: %s", exc)
         finally:
             upstream_resp.release()
             await session.close()
 
-        await resp.write_eof()
+        try:
+            await resp.write_eof()
+        except (aiohttp.ClientError, ConnectionResetError, asyncio.CancelledError) as exc:
+            # Grok often closes the SSE socket as soon as it has enough; don't 500.
+            logger.debug("proxy: client closed before stream eof: %s", exc)
         return resp
 
     # /health doesn't go through the upstream
@@ -255,7 +288,8 @@ async def run_server(
     """
     if not AIOHTTP_AVAILABLE:
         raise RuntimeError(
-            "aiohttp is required for `hermes proxy`. Run `hermes setup` to install it."
+            "aiohttp is required for `hermes proxy`. Install with: "
+            "pip install 'hermes-agent[messaging]' or `pip install aiohttp`."
         )
 
     app = create_app(adapter)
